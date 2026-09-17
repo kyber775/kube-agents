@@ -81,7 +81,11 @@ owner: maintainers
 #     returns oldest-first, so on the live install (130 tasks at the time of
 #     writing) the newest card -- this one -- is not in the response at all.
 #     That failure is intermittent while the board is small and permanent past
-#     200 tasks, which is the worst way for a case to be wrong.
+#     200 tasks, which is the worst way for a case to be wrong. Upstream
+#     kanban_list retains oldest-first FIFO for scheduler consistency, and
+#     changing it via local patch was declined in #1048; agents/chat/SOUL.md
+#     §1.5 documents the status-filter constraint for front-door board reads,
+#     and this prompt retains the status filter instruction explicitly.
 #  2. The instruction to keep waiting. The stack returns once the incident is
 #     OPEN, not once the card is finished; measured over 83 completed
 #     k8s-evt-* cards on the live install, an uncontended card runs a median of
