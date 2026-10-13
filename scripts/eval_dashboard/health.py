@@ -458,6 +458,20 @@ SLOW_BASELINE_MIN_RUNS = 20
 SLOW_FACTOR = 1.2
 SLOW_CLEAR_FACTOR = 1.1
 
+# --- Rule 7b: close to deadline -> a note beside the state (#2873) -----------
+# Prow kills pull-kube-agents-smoke-test at PROW_JOB_TIMEOUT (360 minutes
+# today). The slow note measures against the trailing week, so a gradual creep
+# never trips it and an added case trips it at most once. A note beside the
+# state fires when the slowest qualifying run in the last NEAR_DEADLINE_WINDOW
+# is at or above PROW_JOB_TIMEOUT - NEAR_DEADLINE_HEADROOM (300 min), and clears
+# when the slowest run drops below PROW_JOB_TIMEOUT - NEAR_DEADLINE_CLEAR_HEADROOM
+# (280 min). A run qualifies if it meets slow_gate()'s floor (SUCCESS or FAILURE,
+# at least SLOW_MIN_TASKS cases, non-null wall_clock) with storm_reps == 0, or is
+# a killed full run (run.deadline_kill and run.full). Like rule 7 it is GREEN only.
+NEAR_DEADLINE_WINDOW = timedelta(hours=24)
+NEAR_DEADLINE_HEADROOM = timedelta(minutes=60)
+NEAR_DEADLINE_CLEAR_HEADROOM = timedelta(minutes=80)
+
 # --- Rule 8: a backed-up pool -> a note beside the state, never a state (#1607)
 # Runs are timed from their start, so nothing else here sees a run that sat in
 # the queue first. The pool-pressure periodic (#1069) measures that hourly and
@@ -1403,6 +1417,51 @@ def slow_evidence(slow: dict) -> str:
     )
 
 
+def near_deadline(full_runs, now: datetime, prev: dict | None) -> dict | None:
+    """Rule 7b: the note's numbers while runs are close to the deadline, else None.
+
+    `prev` is the previous tick's note (health.json's `near_deadline`); an episode in
+    progress keeps its `since` and clears below PROW_JOB_TIMEOUT - NEAR_DEADLINE_CLEAR_HEADROOM
+    rather than PROW_JOB_TIMEOUT - NEAR_DEADLINE_HEADROOM.
+    """
+    qualifying = [
+        run
+        for run in _in_window(full_runs, now, NEAR_DEADLINE_WINDOW)
+        if run.wall_clock
+        and run.storm_reps == 0
+        and (
+            (run.result in (RUN_SUCCESS, RUN_FAILURE) and len(run.tasks) >= SLOW_MIN_TASKS)
+            or (run.deadline_kill and run.full)
+        )
+    ]
+    if not qualifying:
+        return prev
+    slowest = max(qualifying, key=lambda r: (r.wall_clock, r.finished or now))
+    max_s = int(slowest.wall_clock.total_seconds())
+    timeout_s = int(PROW_JOB_TIMEOUT.total_seconds())
+    threshold_s = timeout_s - int((NEAR_DEADLINE_CLEAR_HEADROOM if prev else NEAR_DEADLINE_HEADROOM).total_seconds())
+    if max_s < threshold_s:
+        return None
+    return {
+        "since": (prev or {}).get("since") or iso(now),
+        "runs": len(qualifying),
+        "max_s": max_s,
+        "max_build": slowest.build_id,
+        "deadline_s": timeout_s,
+    }
+
+
+def near_deadline_evidence(near: dict) -> str:
+    headroom_min = (near["deadline_s"] - near["max_s"]) // 60
+    timeout_min = near["deadline_s"] // 60
+    max_min = near["max_s"] // 60
+    build = f" (build {near['max_build']})" if near.get("max_build") else ""
+    return (
+        f"close to deadline: slowest run {max_min} min in the last 24h{build},"
+        f" {headroom_min} min under the {timeout_min}-minute timeout"
+    )
+
+
 def _as_seconds(minutes) -> int | None:
     """pool-pressure.json reports minutes; health.json stores seconds.
 
@@ -2313,6 +2372,9 @@ def adjudicate(
     slow = slow_gate(assessed["full_runs"], now, (prev or {}).get("slow") or None) if decided["state"] == GREEN else None
     if slow:
         evidence.append(slow_evidence(slow))
+    near = near_deadline(assessed["full_runs"], now, (prev or {}).get("near_deadline") or None) if decided["state"] == GREEN else None
+    if near:
+        evidence.append(near_deadline_evidence(near))
     # Rule 8 rides beside the state in every state, unlike rule 7: the wait is
     # a different job's measurement of different data, so it cannot be this
     # incident's own symptom, and when leases are the incident it is the
@@ -2392,6 +2454,7 @@ def adjudicate(
         "fixture_state": fixture_state_block(assessed["fixture"]),
         "pool_state": scan_block(assessed["pool_state"]),
         "slow": slow,
+        "near_deadline": near,
         "pool": pool,
         "periodics": watched,
         "periodics_read": sorted(readings),
@@ -2477,19 +2540,20 @@ def replay(data: dict, step: timedelta, roster: Roster, start: datetime | None =
 
 
 def timeline(ticks, every: bool = False) -> list[dict]:
-    """The state changes in a replay: [{at, state, cause, failing_cases, slow}].
+    """The state changes in a replay: [{at, state, cause, failing_cases, slow, near_deadline}].
 
     A change is a new state, a new condition, or a new set of failing
     cases within an OUTAGE -- the things the poster reacts to -- and the
-    slow note (rule 7) appearing or clearing, since the poster reacts to
-    that too. A storm window's bounds move every tick and are detail, not
-    a change. `every` keeps all ticks.
+    slow note (rule 7) or near_deadline note (rule 7b) appearing or
+    clearing, since the poster reacts to that too. A storm window's bounds
+    move every tick and are detail, not a change. `every` keeps all ticks.
     """
     out = []
     last = None
     for now, health in ticks:
         slow = health.get("slow") or None
-        key = (health["state"], health["condition"], tuple(health["failing_cases"]), bool(slow))
+        near = health.get("near_deadline") or None
+        key = (health["state"], health["condition"], tuple(health["failing_cases"]), bool(slow), bool(near))
         if every or key != last:
             out.append(
                 {
@@ -2500,6 +2564,7 @@ def timeline(ticks, every: bool = False) -> list[dict]:
                     "failing_cases": health["failing_cases"],
                     "recovering": health["recovering"],
                     "slow": {"since": slow["since"], "median_s": slow["median_s"], "baseline_p50_s": slow["baseline_p50_s"]} if slow else None,
+                    "near_deadline": {"since": near["since"], "max_s": near["max_s"], "deadline_s": near["deadline_s"]} if near else None,
                 }
             )
             last = key
@@ -2513,6 +2578,9 @@ def format_timeline(entries: list[dict]) -> str:
         slow = entry.get("slow")
         if slow:
             flag += f" (slow since {slow['since']}: median {slow['median_s'] // 60} min against {slow['baseline_p50_s'] // 60})"
+        near = entry.get("near_deadline")
+        if near:
+            flag += f" (near deadline since {near['since']}: max {near['max_s'] // 60} min of {near['deadline_s'] // 60})"
         lines.append(f"{entry['at']}  {entry['state']:<8}  {entry['cause']}{flag}")
     return "\n".join(lines)
 

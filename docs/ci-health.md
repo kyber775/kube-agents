@@ -266,6 +266,37 @@ fired from 2:00 PM ET and stayed quiet over 09-06 to 09-09 and the 09-12/13
 weekend. Model latency is not sampled: the per-repetition eval logs carry
 it, and reading them is not something a tick does.
 
+## Close to the deadline
+
+The slow note measures against the trailing week, so a gradual creep never
+trips it and an added case trips it at most once. `pull-kube-agents-smoke-test`
+has a hard 360-minute Prow deadline (in oss-test-infra, mirrored in
+`health.py` as `PROW_JOB_TIMEOUT`), and runs that approach it give no
+warning until 3+ runs on 2+ PRs are killed and trip a deadline-kill OUTAGE.
+
+`health.json`'s `near_deadline` is set, while the state is GREEN, when the
+slowest qualifying run finished in the last 24 hours took at least 300 minutes
+(timeout − 60 min), and stays set until the slowest run drops below 280 minutes
+(timeout − 80 min). A run qualifies if it finished with at least 13 tasks (the
+slow-gate floor), had 0 storm repetitions, and recorded a non-null wall clock;
+runs cut short by Prow's deadline (`run.deadline_kill and run.full`) also qualify
+regardless of task count, because writer cases run last. If a 24-hour window holds
+no qualifying runs (such as over a quiet weekend), the previous note's state is
+kept unchanged.
+
+The poster sends one line the first tick the note appears:
+
+```text
+⏱ Smoke gate: close to the deadline — slowest run 327 min in the last 24h,
+33 min under the 360-minute Prow timeout. Not a break. Check the run cost
+before adding a case to hack/eval/presubmit-cases.txt.
+```
+
+and repeats it in the daily digest while it lasts. If the Prow timeout in
+oss-test-infra (`prow/prowjobs/gke-labs/kube-agents/kube-agents-presubmits.yaml`)
+changes, `PROW_JOB_TIMEOUT` in `health.py` (and its copies in `classify.py`,
+`gate_issue.py`, and `hack/ci-eval-pr.sh`) must be updated in the same step.
+
 ## A backed-up pool
 
 Every number above is measured from a run's start, so nothing here sees a run

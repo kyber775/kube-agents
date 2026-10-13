@@ -40,6 +40,7 @@ LOST_FIXTURE = TESTDATA / "lost-pods-2026-09-11.json.gz"
 DEADLINE_FIXTURE = TESTDATA / "deadline-kills-2026-09-22.json.gz"
 # The week ending 2026-09-14 18:20Z: every run green, every run long (#1586).
 SLOW_FIXTURE = TESTDATA / "slow-gate-2026-09-14.json.gz"
+NEAR_DEADLINE_FIXTURE = TESTDATA / "near-deadline-2026-09-17.json.gz"
 ROSTER_0911 = [
     "reliability-pdb-probe",
     "security-overgrant-probe",
@@ -1238,6 +1239,86 @@ class SlowGate(unittest.TestCase):
         self.assertTrue(result["evidence"][-1].endswith("; 3 reps lost to infra"), result["evidence"])
 
 
+class NearDeadline(unittest.TestCase):
+    def runs_data(self, minutes_list, end=T0, tasks=None, storm_tasks=False, deadline_kills=None):
+        runs = []
+        for i, m in enumerate(minutes_list):
+            t = tasks or full_tasks()
+            if storm_tasks:
+                t = [task("case-1", "eee")] * len(t)
+            r = run(200 + i, 50 + i, end - timedelta(minutes=10 * (len(minutes_list) - 1 - i)), minutes=m, tasks=t)
+            if deadline_kills and i in deadline_kills:
+                r["result"] = "FAILURE"
+                r["eval_verdict"] = None
+                r["tasks"] = [task("case-0", "p")]
+            runs.append(r)
+        return data(*runs)
+
+    def test_slowest_run_at_or_above_300_min_fires(self):
+        doc = self.runs_data([250, 300, 260])
+        result = adjudicate(doc, T0)
+        self.assertEqual(result["state"], "GREEN")
+        self.assertEqual(
+            result["near_deadline"],
+            {
+                "since": health.iso(T0),
+                "runs": 3,
+                "max_s": 300 * 60,
+                "max_build": "201",
+                "deadline_s": 360 * 60,
+            },
+        )
+        self.assertIn("close to deadline: slowest run 300 min in the last 24h (build 201), 60 min under the 360-minute timeout", result["evidence"])
+
+    def test_clear_with_hysteresis(self):
+        doc_290 = self.runs_data([250, 290])
+        self.assertIsNone(adjudicate(doc_290, T0)["near_deadline"])
+
+        active = adjudicate(self.runs_data([250, 310]), T0)
+        later = T0 + timedelta(hours=1)
+        held = adjudicate(self.runs_data([250, 290], end=later), later, prev=active)
+        self.assertIsNotNone(held["near_deadline"])
+        self.assertEqual(held["near_deadline"]["since"], active["near_deadline"]["since"])
+        self.assertEqual(held["near_deadline"]["max_s"], 290 * 60)
+
+        cleared = adjudicate(self.runs_data([250, 279], end=later), later, prev=held)
+        self.assertIsNone(cleared["near_deadline"])
+
+    def test_empty_window_keeps_previous_note(self):
+        active = adjudicate(self.runs_data([320]), T0)
+        self.assertIsNotNone(active["near_deadline"])
+        later = T0 + timedelta(hours=30)
+        empty_doc = data()
+        held = adjudicate(empty_doc, later, prev=active)
+        self.assertEqual(held["near_deadline"], active["near_deadline"])
+
+    def test_storm_runs_ignored(self):
+        doc = self.runs_data([320], storm_tasks=True)
+        result = adjudicate(doc, T0)
+        self.assertIsNone(result["near_deadline"])
+
+    def test_killed_partial_runs_counted(self):
+        doc = self.runs_data([362], deadline_kills={0})
+        result = adjudicate(doc, T0)
+        self.assertIsNotNone(result["near_deadline"])
+        self.assertEqual(result["near_deadline"]["max_s"], 362 * 60)
+        self.assertEqual(result["near_deadline"]["runs"], 1)
+
+    def test_short_runs_ignored(self):
+        short = [task("case-0", "p")]
+        doc = self.runs_data([320], tasks=short)
+        result = adjudicate(doc, T0)
+        self.assertIsNone(result["near_deadline"])
+
+    def test_no_note_outside_green(self):
+        doc = self.runs_data([320])
+        doc["runs"] += [run(400 + i, pr, T0 - timedelta(minutes=10 * i), minutes=1, result="FAILURE") for i, pr in enumerate([1, 1, 2])]
+        degraded = adjudicate(doc, T0)
+        self.assertEqual(degraded["state"], "DEGRADED")
+        self.assertIsNone(degraded["near_deadline"])
+        self.assertFalse(any(line.startswith("close to deadline") for line in degraded["evidence"]))
+
+
 # --------------------------------------------------------------------------- #
 # Rule 8: pool pressure
 # --------------------------------------------------------------------------- #
@@ -2233,6 +2314,42 @@ class SlowGateReplay(unittest.TestCase):
         self.assertEqual([int(r.wall_clock.total_seconds() // 60) for r in full[-3:]], [207, 152, 167])
         self.assertEqual(int(p90 // 60), 198)
         self.assertFalse(all(r.wall_clock.total_seconds() > p90 for r in full[-3:]))
+
+
+class NearDeadlineReplay(unittest.TestCase):
+    """2026-09-17 (#2873): a fixture trimmed around the 356-minute run of that
+    day. The near_deadline note appears when that run finishes and stays active
+    for 24 hours, clearing once the run rolls out of the window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.data = health.load_json(NEAR_DEADLINE_FIXTURE)
+        assert cls.data is not None
+        cls.every = list(health.replay(cls.data, timedelta(hours=1), health.Roster.fixed(ROSTER_0911)))
+        cls.timeline = health.timeline(cls.every)
+
+    def tick(self, when):
+        return next(h for now, h in self.every if now == when)
+
+    def test_fires_on_the_356_minute_run_and_clears_after_24_hours(self):
+        t_before = datetime(2026, 9, 17, 13, 0, tzinfo=timezone.utc)
+        t_fire = datetime(2026, 9, 17, 14, 0, tzinfo=timezone.utc)
+        t_during = datetime(2026, 9, 17, 20, 0, tzinfo=timezone.utc)
+        t_after = datetime(2026, 9, 18, 15, 0, tzinfo=timezone.utc)
+
+        self.assertIsNone(self.tick(t_before)["near_deadline"])
+
+        firing = self.tick(t_fire)
+        self.assertIsNotNone(firing["near_deadline"])
+        self.assertEqual(firing["near_deadline"]["max_s"], 356 * 60)
+        self.assertEqual(firing["near_deadline"]["max_build"], "356001")
+        self.assertIn("close to deadline: slowest run 356 min in the last 24h (build 356001), 4 min under the 360-minute timeout", firing["evidence"])
+
+        during = self.tick(t_during)
+        self.assertIsNotNone(during["near_deadline"])
+        self.assertEqual(during["near_deadline"]["since"], firing["near_deadline"]["since"])
+
+        self.assertIsNone(self.tick(t_after)["near_deadline"])
 
 
 class CommandLine(unittest.TestCase):

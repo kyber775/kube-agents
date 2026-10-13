@@ -88,6 +88,22 @@ def slow(**note):
     return doc
 
 
+def near_deadline_note(since="2026-09-17T18:00:00+00:00", max_s=327 * 60, deadline_s=360 * 60, runs=14, max_build="123456"):
+    return {
+        "since": since,
+        "runs": runs,
+        "max_s": max_s,
+        "max_build": max_build,
+        "deadline_s": deadline_s,
+    }
+
+
+def near_deadline(**note):
+    doc = health()
+    doc["near_deadline"] = near_deadline_note(**note)
+    return doc
+
+
 def pool_note(verdict="BREACH", cause="CAPACITY", since="2026-09-04T09:00:00+00:00", **over):
     """health.py's rule-8 note. The default is the #1069 incident's shape: a
     full pool, two runs queued past the limit, and a 22-minute median over the
@@ -805,6 +821,44 @@ class SlowNote(RunHarness):
         self.tick(slow(), self.at(10, 30))
         self.assertEqual([text.split(" ")[0] for text in self.opener.texts][2:], ["🟢", "🐢"])
         self.assertTrue(self.recorded()["slow"])
+
+
+class NearDeadlineNote(RunHarness):
+    def test_posted_once_per_episode_and_again_after_it_clears(self):
+        self.tick(near_deadline(), self.at(10))
+        self.tick(near_deadline(), self.at(10, 15))
+        self.tick(near_deadline(), self.at(10, 30))
+        self.assertEqual(len(self.opener.requests), 1, "one note for the episode")
+        self.assertTrue(self.recorded()["near_deadline"])
+        self.assertIn("⏱ *Smoke gate: close to the deadline* — slowest run 327 min in the last 24h, 33 min under the 360-minute Prow timeout.", self.opener.texts[0])
+
+        self.tick(health(), self.at(10, 45))
+        self.assertEqual(len(self.opener.requests), 1, "clearing is not news")
+        self.assertFalse(self.recorded()["near_deadline"])
+
+        self.tick(near_deadline(max_s=310 * 60), self.at(15))
+        self.assertEqual(len(self.opener.requests), 2, "a new episode is")
+
+    def test_a_failed_note_is_retried_next_tick(self):
+        self.tick(health(), T0)
+        rc, err = self.tick(near_deadline(), T0.replace(minute=15), opener=FakeOpener(statuses=[500]))
+        self.assertEqual(rc, 1)
+        self.assertIn("failed to post: near_deadline", err)
+        self.assertFalse(self.recorded()["near_deadline"], "not told yet")
+        self.tick(near_deadline(), T0.replace(minute=30))
+        self.assertEqual(len(self.opener.requests), 1)
+        self.assertTrue(self.recorded()["near_deadline"])
+
+    def test_digest_carries_the_near_deadline_line_while_it_lasts(self):
+        self.tick(near_deadline(), T0.replace(hour=7))
+        self.tick(near_deadline(), self.at(DIGEST_UTC, 5))
+        self.assertEqual(
+            self.opener.texts[1].split("\n")[1],
+            "⏱ Close to the deadline since 2:00 PM ET: slowest run 327 min, 33 min of headroom.",
+        )
+        self.tick(health(), self.at(DIGEST_UTC, 5, day=5))
+        self.assertEqual(len(self.opener.texts), 3)
+        self.assertNotIn("Close to the deadline since", self.opener.texts[2])
 
 
 class PoolNote(RunHarness):
